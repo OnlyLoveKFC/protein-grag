@@ -44,9 +44,9 @@ GO_SYS = "GO_{id}"
 ### Prepare LLM
 WORKING_DIR = "./proteinKG_cache"
 # Assumed llm model settings
-LLM_BASE_URL = "https://api.deepseek.com"
-LLM_API_KEY = "YOUR_API_KEY"
-MODEL = "deepseek-chat"
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.deepseek.com")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "YOUR_API_KEY")
+MODEL = os.getenv("LLM_MODEL", "deepseek-chat")
 
 
 # Assumed embedding model settings

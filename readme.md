@@ -1,5 +1,7 @@
 # Protein-GraphRAG
 
+Based on [GraphRAG]("https://github.com/gusye1234/nano-graphrag"), a simple, easy-to-hack GraphRAG implementation.
+
 ## Install
 
 **Install from source** (recommend)
@@ -24,8 +26,14 @@ python proteinKG.py --prepare_kg_data
 
 Search for the relationship between a protein with ID 309507 and a GO term with ID 219.
 ```shell
-# fill in your LLM API key in proteinKG.py first
-python proteinKG.py --protein_node_id 309507 --go_node_id 219
+# fill in your LLM API key in proteinKG.py first, DeepSeek for example
+export LLM_BASE_URL=https://api.deepseek.com
+export LLM_API_KEY=sk-4e9ca3862cc44b50852afdc516a1b360
+export LLM_MODEL=deepseek-chat
+
+python proteinKG.py \
+    --protein_node_id 309507 \
+    --go_node_id 219
 ```
 
 The LLM will generate the relationship between the protein and the GO term.
