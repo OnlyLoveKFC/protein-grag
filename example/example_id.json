@@ -1,0 +1,6 @@
+{
+    "prepare_kg_data": false,
+    "generate_seqdb_embedding": false,
+    "protein_node_id": 309507,
+    "go_node_id": 219
+}

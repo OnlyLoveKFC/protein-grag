@@ -13,10 +13,12 @@ import pandas as pd
 from collections import defaultdict
 import pickle
 import networkx as nx
+import json
 
 from nano_graphrag._storage import (
     NetworkXStorage,
     NanoVectorDBStorage,
+    SeqVectorDBStorage,
     JsonKVStorage
 )
 from nano_graphrag._utils import (
@@ -48,23 +50,6 @@ LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.deepseek.com")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "YOUR_API_KEY")
 MODEL = os.getenv("LLM_MODEL", "deepseek-chat")
 
-
-# Assumed embedding model settings
-EMBEDDING_MODEL = "nomic-embed-text"
-EMBEDDING_MODEL_DIM = 768
-EMBEDDING_MODEL_MAX_TOKENS = 8192
-
-@wrap_embedding_func_with_attrs(
-    embedding_dim=EMBEDDING_MODEL_DIM,
-    max_token_size=EMBEDDING_MODEL_MAX_TOKENS,
-)
-async def ollama_embedding(texts :list[str]) -> np.ndarray:
-    embed_text = []
-    for text in texts:
-      data = ollama.embeddings(model=EMBEDDING_MODEL, prompt=text)
-      embed_text.append(data["embedding"])
-    
-    return embed_text
 
 async def llm_model_if_cache(
     prompt, system_prompt=None, history_messages=[], **kwargs
@@ -122,9 +107,11 @@ class ProteinKGConfig(NamedTuple):
 
 class ProteinVectorDBConfig(NamedTuple):
     working_dir: str = WORKING_DIR
-    embedding_func: EmbeddingFunc = ollama_embedding
-    embedding_batch_num: int = 32
-    embedding_func_max_async: int = 16
+    esmc_model: str = "esmc_300m"
+    device: str = "cuda"
+    embedding_batch_num: int = 1
+    embedding_dim: int = 960
+    embedding_func_max_async: int = 1
     query_better_than_threshold: float = 0.2
 
 class ProteinKGCommunityConfig(NamedTuple):
@@ -159,6 +146,8 @@ def prepare_kg_global_config():
     if not osp.exists(kg_global_config.working_dir):
         os.makedirs(kg_global_config.working_dir, exist_ok=True)
 
+    vdb_global_config = ProteinVectorDBConfig()
+    
     community_global_config = ProteinKGCommunityConfig()
     if not osp.exists(community_global_config.working_dir):
         os.makedirs(community_global_config.working_dir, exist_ok=True)
@@ -168,9 +157,10 @@ def prepare_kg_global_config():
     
     global_config = {
         **kg_global_config._asdict(),
+        **vdb_global_config._asdict(),
         **community_global_config._asdict(),
         **llm_global_config._asdict(),
-        **extension_global_config._asdict()
+        **extension_global_config._asdict(),
     }
     return global_config
 
@@ -208,6 +198,9 @@ async def upsert_protein_kg():
             GO_ID2CLASS[int(go_id)] = go_name
 
     GO_CLASS2ID = {v: k for k, v in GO_ID2CLASS.items()}
+    
+    with open(osp.join(WORKING_DIR, "go_name2id.json"), "w") as f:
+        f.write(json.dumps(GO_CLASS2ID, indent=4))
 
     PROTEIN_ID2NAME = {}
     with open(osp.join(ROOT_DIR, "protein2id.txt"), "r") as f:
@@ -216,6 +209,19 @@ async def upsert_protein_kg():
             PROTEIN_ID2NAME[int(protein_id)] = protein_name
 
     PROTEIN_NAME2ID = {v: k for k, v in PROTEIN_ID2NAME.items()}
+    
+    with open(osp.join(WORKING_DIR, "protein_name2id.json"), "w") as f:
+        f.write(json.dumps(PROTEIN_NAME2ID, indent=4))
+        
+    PROTEIN_SEQ2ID = defaultdict(list)
+    with open(osp.join(ROOT_DIR, "protein_seq.txt"), 'r') as f:
+        for i, line in enumerate(f):
+            PROTEIN_SEQ2ID[line.strip()].append(i)
+
+    PROTEIN_ID2SEQ = {i: seq for seq, ids in PROTEIN_SEQ2ID.items() for i in ids}
+    
+    with open(osp.join(WORKING_DIR, "protein_seq2id.json"), "w") as f:
+        f.write(json.dumps(PROTEIN_SEQ2ID, indent=4))
 
     RELATION_ID2NAME = {}
     with open(osp.join(ROOT_DIR, "relation2id.txt"), "r") as f:
@@ -224,7 +230,10 @@ async def upsert_protein_kg():
             RELATION_ID2NAME[int(relation_id)] = relation_name
 
     RELATION_NAME2ID = {v: k for k, v in RELATION_ID2NAME.items()}
-
+    
+    with open(osp.join(WORKING_DIR, "relation_name2id.json"), "w") as f:
+        f.write(json.dumps(RELATION_NAME2ID, indent=4))
+        
     GO_DEF = {}
     with open(osp.join(ROOT_DIR, "go_def.txt"), "r") as f:
         for i, line in enumerate(f):
@@ -262,6 +271,16 @@ async def upsert_protein_kg():
             protein_id, relation, go_id = line.strip().split(" ")
             PROTEIN_GO_TRIPLET.append((int(protein_id), int(relation), int(go_id)))
             
+            
+
+    PROTEIN_SEQ2ID = defaultdict(list)
+    with open(osp.join(ROOT_DIR, "protein_seq.txt"), 'r') as f:
+        for i, line in enumerate(f):
+            PROTEIN_SEQ2ID[line.strip()].append(i)
+
+    PROTEIN_ID2SEQ = {i: seq for seq, ids in PROTEIN_SEQ2ID.items() for i in ids}
+     
+     
 
     PROTEIN_SEQ2ID = defaultdict(list)
     with open(osp.join(ROOT_DIR, "protein_seq.txt"), 'r') as f:
@@ -344,6 +363,38 @@ async def upsert_protein_kg():
         pickle.dump(knwoledge_graph_inst, f)
     logger.info("Upserted nodes and edges")
 
+
+async def search_seqdb(query: str):
+    
+    seqdb = SeqVectorDBStorage(
+        namespace="protein_seqdb",
+        global_config=global_config
+    )
+    logger.info(f"Searching in the seqdb with query: {query}")
+    results = await seqdb.query(query)
+    return results
+
+async def generate_seqdb_embedding():
+    
+    # Load the graph from pickle file
+    kg_fpath = osp.join(global_config["working_dir"], f"graph_protein_kg.pkl")
+    with open(kg_fpath, "rb") as f:
+        logger.info(f"Loading graph from pickle file: {kg_fpath}")
+        knwoledge_graph_inst: NetworkXStorage = pickle.load(f)
+    logger.info(knwoledge_graph_inst._graph)
+    
+    seqs_dict = {}
+    for node, node_data in knwoledge_graph_inst._graph.nodes(data=True):
+        if node.startswith("PROTEIN_"):
+            seqs_dict[node] = node_data["description"]
+    
+    seqdb = SeqVectorDBStorage(
+        namespace="protein_seqdb",
+        global_config=global_config
+    )
+    await seqdb.upsert(seqs_dict)
+    await seqdb.index_done_callback()
+    
 
 async def shortest_path(protein_node_id: str, go_node_id: str):
     
@@ -477,7 +528,7 @@ async def generate_kg_report(protein_node_id: str, go_node_id: str):
     return response
 
 
-async def query_kg(protein_node_id: str, go_node_id: str):
+async def query_kg_by_id(protein_node_id: str, go_node_id: str):
     
     await shortest_path(
         protein_node_id=protein_node_id,
@@ -502,27 +553,103 @@ async def query_kg(protein_node_id: str, go_node_id: str):
     logger.info(response)
     
 
-def register_args():
+async def query_kg_by_seq(protein_seq: str, go_class: str):
+    
+    with open(
+        osp.join(
+            global_config["working_dir"], 
+            "protein_seq2id.json"
+        ), "r"
+    ) as f:
+        protein_seq2id = json.load(f)
+    with open(
+        osp.join(
+            global_config["working_dir"],
+            "go_name2id.json"
+        ), "r"
+    ) as f:
+        go_name2id = json.load(f)
+    if protein_seq in protein_seq2id:
+        protein_node_id = f"PROTEIN_{protein_seq2id[protein_seq][0]}"
+    else:
+        logger.info("Protein sequence is not in the graph ")
+        logger.info("Searching in the protein seqdb ")
+        results = await search_seqdb(protein_seq)
+        # Update the protein node id with top-1 result
+        protein_node_id, similarity = results[0]["id"], results[0]["distance"]
+        logger.info(
+            f"Updated protein node {protein_node_id} with "
+            f"highest similarity {similarity} "
+        )
+    go_node_id = f"GO_{go_name2id[go_class]}"
+    
+    await shortest_path(
+        protein_node_id=protein_node_id,
+        go_node_id=go_node_id
+    )
+
+    response = await generate_kg_report(
+        protein_node_id=protein_node_id,
+        go_node_id=go_node_id
+    )
+    
+    use_model_func = global_config["best_model_func"]
+    
+    query = "Does this PROTEIN belong to this GO class?"
+    sys_prompt_temp = PROMPTS["proteinkg_rag_response"]
+    response = await use_model_func(
+        query,
+        sys_prompt_temp.format(
+            context_data=response
+        ),
+    )
+    logger.info(response)
+    
+
+def parse_config():
     parser = argparse.ArgumentParser()
     parser.add_argument("--prepare_kg_data", action="store_true")
-    parser.add_argument("--protein_node_id", type=str, default="445020")
-    parser.add_argument("--go_node_id", type=str, default="220")
+    parser.add_argument("--generate_seqdb_embedding", action="store_true")
+    parser.add_argument("--config", type=str, default=None)
     args = parser.parse_args()
-    return args
+    
+    with open(args.config, "r") as f:
+        config: dict = json.load(f)
+    
+    # Update the config with the command line arguments
+    config.update(**args.__dict__)
+    logger.info(config)
+    return config
 
 if __name__ == "__main__":
     
-    args = register_args()
-    if args.prepare_kg_data:
+    config = parse_config()
+    if config.get("prepare_kg_data", False):
         asyncio.run(upsert_protein_kg())
+    if config.get("generate_seqdb_embedding", False):
+        asyncio.run(generate_seqdb_embedding())
     
-    # Add PREFIX
-    protein_node_id = f"PROTEIN_{args.protein_node_id}"
-    go_node_id = f"GO_{args.go_node_id}"
-    asyncio.run(
-        query_kg(
-            protein_node_id=protein_node_id,
-            go_node_id=go_node_id
+    if config.get("protein_node_id", None) is not None \
+        and config.get("go_node_id", None) is not None:
+        protein_node_id = f"PROTEIN_{config['protein_node_id']}"
+        go_node_id = f"GO_{config['go_node_id']}"
+        asyncio.run(
+            query_kg_by_id(
+                protein_node_id=protein_node_id,
+                go_node_id=go_node_id
+            )
         )
-    )
+    elif config.get("protein_seq", None) is not None \
+        and config.get("go_class", None) is not None:
+        asyncio.run(
+            query_kg_by_seq(
+                protein_seq=config["protein_seq"],
+                go_class=config["go_class"]
+            )
+        )
+    else:
+        raise ValueError(
+            "Either protein_node_id and go_node_id "
+            "or protein_seq and go_class must be provided"
+        )
 
