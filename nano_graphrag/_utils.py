@@ -12,7 +12,12 @@ from typing import Any, Union
 
 import numpy as np
 import tiktoken
+from rich.logging import RichHandler
 
+FORMAT = "%(message)s"
+logging.basicConfig(
+    level="INFO", format=FORMAT, datefmt="[%X]", handlers=[RichHandler()]
+)
 logger = logging.getLogger("nano-graphrag")
 ENCODER = None
 

@@ -1,20 +1,23 @@
 import argparse
+import asyncio
+import json
+import logging
 import os
 import os.path as osp
+import pickle
+from collections import defaultdict
+from functools import partial
 from pathlib import Path
 from typing import NamedTuple
-import asyncio
-from tqdm import tqdm
-import ollama
-import numpy as np
-import logging
-from functools import partial
-import pandas as pd
-from collections import defaultdict
-import pickle
-import networkx as nx
-import json
 
+import numpy as np
+import pandas as pd
+import networkx as nx
+from tqdm import tqdm
+from rich.logging import RichHandler
+from openai import AsyncOpenAI
+
+import ollama
 from nano_graphrag._storage import (
     NetworkXStorage,
     NanoVectorDBStorage,
@@ -29,16 +32,8 @@ from nano_graphrag._utils import (
     compute_args_hash,
     convert_response_to_json
 )
-from openai import AsyncOpenAI
 from nano_graphrag.prompt import PROMPTS
-from rich.logging import RichHandler
-
-FORMAT = "%(message)s"
-logging.basicConfig(
-    level="WARNING", format=FORMAT, datefmt="[%X]", handlers=[RichHandler()]
-)
-logger = logging.getLogger("nano-graphrag")
-logger.setLevel(logging.INFO)
+from nano_graphrag._utils import logger
 
 PROTEIN_SYS = "PROTEIN_{id}"
 GO_SYS = "GO_{id}"
@@ -407,6 +402,23 @@ async def shortest_path(protein_node_id: str, go_node_id: str):
     path = nx.shortest_path(knwoledge_graph_inst._graph, protein_node_id, go_node_id)
     logger.info(path)
     
+    entity_fpath = osp.join(
+        global_config["working_dir"], 
+        f"{protein_node_id}-{go_node_id}",
+        f"entity.csv"
+    )
+    edge_fpath = osp.join(
+        global_config["working_dir"], 
+        f"{protein_node_id}-{go_node_id}",
+        f"relation.csv"
+    )
+    
+    # Detect the entity and edge csv file
+    if osp.exists(entity_fpath) and osp.exists(edge_fpath):
+        logger.info(f"Entity and edge csv files already exist ")
+        logger.info(f"Skip generating and using cached csv files")
+        return
+    
     entity_df = pd.DataFrame(columns=["entity_attr", "entity_name", "description"])
     edge_df = pd.DataFrame(columns=["source", "target", "description"])
     
@@ -445,16 +457,6 @@ async def shortest_path(protein_node_id: str, go_node_id: str):
     logger.info(entity_df)
     logger.info(edge_df)
     
-    entity_fpath = osp.join(
-        global_config["working_dir"], 
-        f"{protein_node_id}-{go_node_id}",
-        f"entity.csv"
-    )
-    edge_fpath = osp.join(
-        global_config["working_dir"], 
-        f"{protein_node_id}-{go_node_id}",
-        f"relation.csv"
-    )
     os.makedirs(osp.dirname(entity_fpath), exist_ok=True)
     entity_df.to_csv(entity_fpath, index=False)
     os.makedirs(osp.dirname(edge_fpath), exist_ok=True)
