@@ -1,6 +1,6 @@
 # Protein-GraphRAG
 
-Based on [GraphRAG]("https://github.com/gusye1234/nano-graphrag"), a simple, easy-to-hack GraphRAG implementation with ProteinKG.
+Based on [GraphRAG](https://github.com/gusye1234/nano-graphrag), a simple, easy-to-hack GraphRAG implementation with ProteinKG.
 
 ## Install
 

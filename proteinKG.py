@@ -8,7 +8,7 @@ import pickle
 from collections import defaultdict
 from functools import partial
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, Union
 
 import numpy as np
 import pandas as pd
@@ -16,6 +16,13 @@ import networkx as nx
 from tqdm import tqdm
 from rich.logging import RichHandler
 from openai import AsyncOpenAI
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    roc_auc_score,
+    recall_score,
+    precision_score
+)
 
 import ollama
 from nano_graphrag._storage import (
@@ -160,6 +167,18 @@ def prepare_kg_global_config():
     return global_config
 
 global_config = prepare_kg_global_config()
+
+# Load the graph from pickle file
+kg_fpath = osp.join(global_config["working_dir"], f"graph_protein_kg.pkl")
+with open(kg_fpath, "rb") as f:
+    logger.info(f"Loading graph from pickle file: {kg_fpath}")
+    knwoledge_graph_inst: NetworkXStorage = pickle.load(f)
+logger.info(knwoledge_graph_inst._graph)
+
+SEQDB = SeqVectorDBStorage(
+    namespace="protein_seqdb",
+    global_config=global_config
+)
 
 async def upsert_protein_kg():
     
@@ -361,22 +380,11 @@ async def upsert_protein_kg():
 
 async def search_seqdb(query: str):
     
-    seqdb = SeqVectorDBStorage(
-        namespace="protein_seqdb",
-        global_config=global_config
-    )
     logger.info(f"Searching in the seqdb with query: {query}")
-    results = await seqdb.query(query)
+    results = await SEQDB.query(query)
     return results
 
 async def generate_seqdb_embedding():
-    
-    # Load the graph from pickle file
-    kg_fpath = osp.join(global_config["working_dir"], f"graph_protein_kg.pkl")
-    with open(kg_fpath, "rb") as f:
-        logger.info(f"Loading graph from pickle file: {kg_fpath}")
-        knwoledge_graph_inst: NetworkXStorage = pickle.load(f)
-    logger.info(knwoledge_graph_inst._graph)
     
     seqs_dict = {}
     for node, node_data in knwoledge_graph_inst._graph.nodes(data=True):
@@ -393,12 +401,6 @@ async def generate_seqdb_embedding():
 
 async def shortest_path(protein_node_id: str, go_node_id: str):
     
-    # Load the graph from pickle file
-    kg_fpath = osp.join(global_config["working_dir"], f"graph_protein_kg.pkl")
-    with open(kg_fpath, "rb") as f:
-        logger.info(f"Loading graph from pickle file: {kg_fpath}")
-        knwoledge_graph_inst: NetworkXStorage = pickle.load(f)
-    logger.info(knwoledge_graph_inst._graph)
     path = nx.shortest_path(knwoledge_graph_inst._graph, protein_node_id, go_node_id)
     logger.info(path)
     
@@ -553,6 +555,7 @@ async def query_kg_by_id(protein_node_id: str, go_node_id: str):
         ),
     )
     logger.info(response)
+    return response
     
 
 async def query_kg_by_seq(protein_seq: str, go_class: str):
@@ -606,29 +609,33 @@ async def query_kg_by_seq(protein_seq: str, go_class: str):
         ),
     )
     logger.info(response)
-    
+    return response
+
 
 def parse_config():
     parser = argparse.ArgumentParser()
     parser.add_argument("--prepare_kg_data", action="store_true")
     parser.add_argument("--generate_seqdb_embedding", action="store_true")
     parser.add_argument("--config", type=str, default=None)
+    parser.add_argument("--evaluate", action="store_true")
     args = parser.parse_args()
     
+    return args
+    
+async def main(args):
+    
     with open(args.config, "r") as f:
-        config: dict = json.load(f)
+        config = json.load(f)
     
-    # Update the config with the command line arguments
-    config.update(**args.__dict__)
-    logger.info(config)
-    return config
-
-if __name__ == "__main__":
+    assert isinstance(config, dict), "Config must be a dictionary"
     
-    config = parse_config()
-    if config.get("prepare_kg_data", False):
+    is_prepare_kg_data = args.prepare_kg_data \
+        and config.get("prepare_kg_data", False)
+    is_generate_seqdb_embedding = args.generate_seqdb_embedding \
+        and config.get("generate_seqdb_embedding", False)
+    if is_prepare_kg_data:
         asyncio.run(upsert_protein_kg())
-    if config.get("generate_seqdb_embedding", False):
+    if is_generate_seqdb_embedding:
         asyncio.run(generate_seqdb_embedding())
     
     if config.get("protein_node_id", None) is not None \
@@ -655,3 +662,84 @@ if __name__ == "__main__":
             "or protein_seq and go_class must be provided"
         )
 
+async def evaluate(args):
+    
+    if args.prepare_kg_data:
+        asyncio.run(upsert_protein_kg())
+    if args.generate_seqdb_embedding:
+        asyncio.run(generate_seqdb_embedding())
+        
+    with open(args.config, "r") as f:
+        configs = json.load(f)
+    
+    assert isinstance(configs, list), "Config must be a list"
+    
+    answer_cache = []
+    for item in tqdm(configs):
+        response: str = await query_kg_by_seq(
+            protein_seq=item['protein_seq'],
+            go_class=item['go_class']
+        )
+        answer_cache.append(response)
+
+    with open(osp.join(global_config["working_dir"], "answer_cache.json"), "w") as f:
+        f.write(json.dumps(answer_cache, indent=4))
+        
+async def post_process_answer_cache():
+    
+    with open(osp.join(global_config["working_dir"], "answer_cache.json"), "r") as f:
+        answer_cache = json.load(f)
+    
+    all_preds = []
+    for item in answer_cache:
+        item = item.split(' ')[0][:-1] # Remove '.' or ','
+        if item == "True" or item == "Yes":
+            all_preds.append(1)
+        elif item == "False" or item == "No":
+            all_preds.append(0)
+        else:
+            raise ValueError(f"Invalid answer: {item}")
+    
+    all_preds = np.array(all_preds)
+    np.save(osp.join(global_config["working_dir"], "all_preds_proteinKG.npy"), all_preds)
+    
+
+async def calc_metrics():
+    
+    all_preds_proteinKG = np.load(osp.join(global_config["working_dir"], "all_preds_proteinKG.npy"))
+    all_preds_protllm = np.load(osp.join(global_config["working_dir"], "all_preds_protllm.npy"))
+    all_labels = np.load(osp.join(global_config["working_dir"], "all_labels.npy"))
+    
+    # Accuracy, F1 and AUC
+    acc_proteinKG = accuracy_score(all_labels, all_preds_proteinKG)
+    acc_protllm = accuracy_score(all_labels, all_preds_protllm)
+    f1_proteinKG = f1_score(all_labels, all_preds_proteinKG)
+    f1_protllm = f1_score(all_labels, all_preds_protllm)
+    auc_proteinKG = roc_auc_score(all_labels, all_preds_proteinKG)
+    auc_protllm = roc_auc_score(all_labels, all_preds_protllm)
+    recall_proteinKG = recall_score(all_labels, all_preds_proteinKG)
+    recall_protllm = recall_score(all_labels, all_preds_protllm)
+    precision_proteinKG = precision_score(all_labels, all_preds_proteinKG)
+    precision_protllm = precision_score(all_labels, all_preds_protllm)
+    
+    logger.info(f"Accuracy of proteinKG: {acc_proteinKG}")
+    logger.info(f"Accuracy of protllm: {acc_protllm}")
+    logger.info(f"F1 of proteinKG: {f1_proteinKG}")
+    logger.info(f"F1 of protllm: {f1_protllm}")
+    logger.info(f"AUC of proteinKG: {auc_proteinKG}")
+    logger.info(f"AUC of protllm: {auc_protllm}")
+    logger.info(f"Recall of proteinKG: {recall_proteinKG}")
+    logger.info(f"Recall of protllm: {recall_protllm}")
+    logger.info(f"Precision of proteinKG: {precision_proteinKG}")
+    logger.info(f"Precision of protllm: {precision_protllm}")
+    
+
+if __name__ == "__main__":
+    args = parse_config()
+    
+    if args.evaluate:
+        asyncio.run(evaluate(args))
+        asyncio.run(post_process_answer_cache())
+        asyncio.run(calc_metrics())
+    else:
+        asyncio.run(main(args))
